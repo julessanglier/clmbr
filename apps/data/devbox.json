@@ -1,0 +1,12 @@
+{
+    "packages": ["python3", "gdal"],
+    "shell": {
+        "init_hook": [
+            "export PATH=$PATH:/nix/store/...-gdal/bin",
+            "python -m ensurepip --upgrade",
+            ". $VENV_DIR/bin/activate",
+            "pip install --upgrade pip",
+            "pip install -r requirements.txt"
+        ]
+    }
+}
