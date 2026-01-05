@@ -78,6 +78,28 @@ def get_city_bbox(city_name):
     west, east = float(bbox_osm[2]), float(bbox_osm[3])
     return (south, west, north, east)
 
+def get_city_center(city_name):
+    """Get city center coordinates (lat, lon) from Nominatim."""
+    url = f"https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": city_name,
+        "format": "json",
+        "limit": 1
+    }
+    headers = {"User-Agent": "PythonScript"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+
+    if resp.status_code != 200:
+        raise ValueError(f"Geocoding API error: {resp.status_code}")
+
+    data = resp.json()
+    if not data:
+        raise ValueError(f"City '{city_name}' not found")
+
+    lat = float(data[0]["lat"])
+    lon = float(data[0]["lon"])
+    return (lat, lon)
+
 # =========================
 # DETERMINE REQUIRED SRTM TILES
 # =========================
@@ -174,17 +196,36 @@ def elevation(lon, lat, dems):
 # =========================
 # FETCH OSM ROADS
 # =========================
-def fetch_osm_roads(city_name):
-    query = f"""
-    [out:json][timeout:50];
-    area["name"="{city_name}"]->.searchArea;
-    (
-      way["highway"~"residential|tertiary|secondary|unclassified|service|steps|footway|pedestrian"]["incline"](area.searchArea);
-      way["highway"~"residential|tertiary|secondary|unclassified|service|steps|footway|pedestrian"]["name"~"Montée|Chemin"](area.searchArea);
-    );
-    out geom;
+def fetch_osm_roads(city_name, radius_meters=None):
     """
-    print(f"Fetching OSM roads for {city_name}...")
+    Fetch OSM roads for a city.
+    
+    Args:
+        city_name: Name of the city
+        radius_meters: Optional radius in meters from city center to filter results.
+                      If None, uses area-based query (original behavior).
+    """
+    if radius_meters is not None:
+        # Get city center coordinates
+        lat, lon = get_city_center(city_name)
+        query = f"""
+        [out:json][timeout:50];
+        (
+          way["highway"~"residential|tertiary|secondary|unclassified|service|steps|footway|pedestrian"](around:{radius_meters},{lat},{lon});
+        );
+        out geom;
+        """
+        print(f"Fetching OSM roads for {city_name} within {radius_meters}m of city center ({lat}, {lon})...")
+    else:
+        query = f"""
+        [out:json][timeout:50];
+        area["name"="{city_name}"]->.searchArea;
+        (
+          way["highway"~"residential|tertiary|secondary|unclassified|service|steps|footway|pedestrian"](area.searchArea);
+        );
+        out geom;
+        """
+        print(f"Fetching OSM roads for {city_name}...")
     resp = requests.post("https://overpass-api.de/api/interpreter", data={"data": query}, timeout=120)
     return resp.json()
 
@@ -199,7 +240,7 @@ def main(city_name):
     download_and_convert_dem(tiles)
 
     dems = load_dems()
-    osm_data = fetch_osm_roads(city_name)
+    osm_data = fetch_osm_roads(city_name, 2 * 1000)
 
     # Group and merge roads by name
     roads_by_name = {}
