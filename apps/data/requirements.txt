@@ -1,11 +1,8 @@
 requests
-elevation
 rasterio
 numpy
 scipy
-tdqm
+tqdm
 folium
 shapely
 pyproj
-geopy
-networkx

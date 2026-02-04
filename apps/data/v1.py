@@ -14,7 +14,7 @@ import urllib.parse
 # =========================
 # CONFIGURATION
 # =========================
-CITY_NAME = "Lyon"                  # Input city
+CITY_NAME = "Paris"                  # Input city
 DEM_DIR = "dem_tiles"               # Folder to store DEM tiles
 SAMPLE_STEP_M = 5                   # Distance between points for slope calculation
 MIN_ROAD_LENGTH_M = 20              # Minimum length to consider
@@ -22,6 +22,8 @@ MIN_AVG_SLOPE = 2.0                 # Default slope threshold
 LOWER_SLOPE_FOR_NAME = 1.0          # Lower threshold for "Montée"/"Chemin"
 SHORT_LENGTH_OVERRIDE = 100         # Short roads override threshold
 OUTPUT_FILE = f"steep_roads_{CITY_NAME}.json"
+ELEVATION_SOURCE = "hybrid"         # Options: "dem", "open_elevation", "hybrid" (tries multiple sources)
+USE_BILINEAR_INTERPOLATION = True   # Use bilinear interpolation for DEM (more accurate)
 
 # =========================
 # HELPERS
@@ -51,6 +53,32 @@ def interpolate_nan(array):
     array_interp = np.copy(array)
     array_interp[np.isnan(array)] = np.interp(x[np.isnan(array)], x[good], array[good])
     return array_interp
+
+def smooth_elevation(elevs, window_size=3):
+    """Apply moving average smoothing to elevation data to reduce noise."""
+    if len(elevs) < window_size:
+        return elevs
+    try:
+        from scipy.ndimage import uniform_filter1d
+        # Only smooth non-NaN values
+        valid_mask = ~np.isnan(elevs)
+        if valid_mask.sum() < window_size:
+            return elevs
+        smoothed = np.copy(elevs)
+        smoothed[valid_mask] = uniform_filter1d(elevs[valid_mask], size=window_size, mode='nearest')
+        return smoothed
+    except ImportError:
+        # Fallback: simple moving average if scipy not available
+        smoothed = np.copy(elevs)
+        for i in range(len(elevs)):
+            if not np.isnan(elevs[i]):
+                start = max(0, i - window_size // 2)
+                end = min(len(elevs), i + window_size // 2 + 1)
+                window = elevs[start:end]
+                window = window[~np.isnan(window)]
+                if len(window) > 0:
+                    smoothed[i] = np.mean(window)
+        return smoothed
 
 # =========================
 # FETCH CITY BBOX FROM OSM
@@ -182,15 +210,113 @@ def load_dems(dem_dir=DEM_DIR):
             dems.append((dem, arr))
     return dems
 
-def elevation(lon, lat, dems):
+def elevation_dem(lon, lat, dems, use_bilinear=True):
+    """Get elevation from DEM tiles with optional bilinear interpolation."""
     for dem, arr in dems:
         try:
-            row, col = dem.index(lon, lat)
-            val = arr[row, col]
-            if val != dem.nodata:
-                return float(val)
+            if use_bilinear:
+                # Use bilinear interpolation for more accurate elevation
+                # rasterio.sample uses bilinear by default
+                samples = list(dem.sample([(lon, lat)]))
+                if samples and len(samples) > 0:
+                    val = samples[0]
+                    if val != dem.nodata and not np.isnan(val) and val is not None:
+                        return float(val)
+            else:
+                # Nearest neighbor (original method)
+                row, col = dem.index(lon, lat)
+                val = arr[row, col]
+                if val != dem.nodata:
+                    return float(val)
         except:
             continue
+    return np.nan
+
+def elevation_open_elevation_batch(coords_list, cache=None):
+    """Get elevations from Open Elevation API in batch (more efficient)."""
+    if cache is None:
+        cache = {}
+    
+    # Separate cached and uncached coordinates
+    uncached_coords = []
+    uncached_indices = []
+    results = [np.nan] * len(coords_list)
+    
+    for i, (lon, lat) in enumerate(coords_list):
+        cache_key = (round(lat, 5), round(lon, 5))
+        if cache_key in cache:
+            results[i] = cache[cache_key]
+        else:
+            uncached_coords.append({"latitude": lat, "longitude": lon})
+            uncached_indices.append(i)
+    
+    # Fetch uncached elevations in batch
+    if uncached_coords:
+        try:
+            url = "https://api.open-elevation.com/api/v1/lookup"
+            payload = {"locations": uncached_coords}
+            resp = requests.post(url, json=payload, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "results" in data:
+                    for idx, result in zip(uncached_indices, data["results"]):
+                        elev = result.get("elevation")
+                        if elev is not None:
+                            lon, lat = coords_list[idx]
+                            cache_key = (round(lat, 5), round(lon, 5))
+                            cache[cache_key] = elev
+                            results[idx] = float(elev)
+                        else:
+                            lon, lat = coords_list[idx]
+                            cache_key = (round(lat, 5), round(lon, 5))
+                            cache[cache_key] = np.nan
+                            results[idx] = np.nan
+        except Exception as e:
+            # Mark uncached as NaN
+            for idx in uncached_indices:
+                lon, lat = coords_list[idx]
+                cache_key = (round(lat, 5), round(lon, 5))
+                cache[cache_key] = np.nan
+                results[idx] = np.nan
+    
+    return results
+
+def elevation_open_elevation(lon, lat, cache=None):
+    """Get elevation from Open Elevation API (free, no API key needed)."""
+    results = elevation_open_elevation_batch([(lon, lat)], cache)
+    return results[0] if results else np.nan
+
+def elevation(lon, lat, dems=None, elevation_source="hybrid", elevation_cache=None):
+    """
+    Get elevation from multiple sources with fallback.
+    
+    Args:
+        lon, lat: Coordinates
+        dems: DEM tiles (for "dem" or "hybrid" sources)
+        elevation_source: "dem", "open_elevation", or "hybrid"
+        elevation_cache: Cache dict for API calls
+    """
+    if elevation_cache is None:
+        elevation_cache = {}
+    
+    # Try hybrid approach: DEM first, then Open Elevation API
+    if elevation_source == "hybrid":
+        # Try DEM first (faster, local)
+        if dems:
+            elev = elevation_dem(lon, lat, dems, use_bilinear=USE_BILINEAR_INTERPOLATION)
+            if not np.isnan(elev):
+                return elev
+        # Fall back to Open Elevation API
+        return elevation_open_elevation(lon, lat, cache=elevation_cache)
+    
+    elif elevation_source == "dem":
+        if dems:
+            return elevation_dem(lon, lat, dems, use_bilinear=USE_BILINEAR_INTERPOLATION)
+        return np.nan
+    
+    elif elevation_source == "open_elevation":
+        return elevation_open_elevation(lon, lat, cache=elevation_cache)
+    
     return np.nan
 
 # =========================
@@ -211,7 +337,7 @@ def fetch_osm_roads(city_name, radius_meters=None):
         query = f"""
         [out:json][timeout:50];
         (
-          way["highway"~"residential|tertiary|secondary|unclassified|service|steps|footway|pedestrian"](around:{radius_meters},{lat},{lon});
+          way["highway"](around:{radius_meters},{lat},{lon});
         );
         out geom;
         """
@@ -239,8 +365,11 @@ def main(city_name):
     tiles = srtm_tiles_for_bbox(bbox)
     download_and_convert_dem(tiles)
 
-    dems = load_dems()
+    dems = load_dems() if ELEVATION_SOURCE in ["dem", "hybrid"] else None
     osm_data = fetch_osm_roads(city_name, 2 * 1000)
+    
+    # Initialize elevation cache for API calls
+    elevation_cache = {}
 
     # Group and merge roads by name
     roads_by_name = {}
@@ -266,6 +395,10 @@ def main(city_name):
 
     # Compute slopes and apply Option 3 hybrid logic
     results = []
+    print(f"Using elevation source: {ELEVATION_SOURCE}")
+    if ELEVATION_SOURCE == "open_elevation":
+        print("Note: Open Elevation API may be slower but more accurate for some areas")
+    
     for road in tqdm(merged_roads, desc="Processing roads"):
         line = road["geometry"]
         length_m = meters_length(line)
@@ -276,14 +409,56 @@ def main(city_name):
         points = [line.interpolate(d / length_m, normalized=True) for d in distances]
         lons = [p.x for p in points]
         lats = [p.y for p in points]
-        elevs = np.array([elevation(lon, lat, dems) for lon, lat in zip(lons, lats)])
+        
+        # Batch fetch elevations for better performance
+        if ELEVATION_SOURCE == "open_elevation":
+            elevs = np.array(elevation_open_elevation_batch(list(zip(lons, lats)), elevation_cache))
+        elif ELEVATION_SOURCE == "hybrid":
+            # Try DEM first, then batch fetch missing from API
+            elevs = np.array([elevation_dem(lon, lat, dems, USE_BILINEAR_INTERPOLATION) 
+                            for lon, lat in zip(lons, lats)])
+            # Fill NaN values with Open Elevation API
+            nan_mask = np.isnan(elevs)
+            if nan_mask.any():
+                nan_coords = [(lons[i], lats[i]) for i in range(len(lons)) if nan_mask[i]]
+                nan_elevs = elevation_open_elevation_batch(nan_coords, elevation_cache)
+                nan_idx = 0
+                for i in range(len(elevs)):
+                    if nan_mask[i]:
+                        elevs[i] = nan_elevs[nan_idx]
+                        nan_idx += 1
+        else:  # "dem"
+            elevs = np.array([elevation_dem(lon, lat, dems, USE_BILINEAR_INTERPOLATION) 
+                            for lon, lat in zip(lons, lats)])
         elevs = interpolate_nan(elevs)
+        
+        # Apply smoothing to reduce DEM noise (optional but recommended)
+        if len(elevs) > 3:
+            elevs = smooth_elevation(elevs, window_size=3)
+        
         valid_mask = ~np.isnan(elevs)
         if valid_mask.sum() < 2:
             continue
 
-        dz = np.diff(elevs[valid_mask])
-        slopes = (dz / SAMPLE_STEP_M) * 100
+        # Calculate slopes using actual distances between consecutive points
+        # After interpolation, all points should have valid elevations
+        dz = np.diff(elevs)
+        
+        # Calculate actual distances between consecutive points for accuracy
+        # This accounts for the fact that the last segment may be shorter than SAMPLE_STEP_M
+        dd = []
+        for i in range(len(points) - 1):
+            p1, p2 = points[i], points[i + 1]
+            # Calculate actual distance in meters using Web Mercator
+            coords1 = transformer.transform(p1.x, p1.y)
+            coords2 = transformer.transform(p2.x, p2.y)
+            dist = LineString([coords1, coords2]).length
+            dd.append(dist)
+        dd = np.array(dd)
+        
+        # Avoid division by zero
+        dd = np.where(dd < 0.1, 0.1, dd)
+        slopes = (dz / dd) * 100
         avg_slope = np.mean(np.abs(slopes))
         max_slope = np.max(np.abs(slopes))
         total_gain = np.sum(dz[dz > 0])
