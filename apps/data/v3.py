@@ -757,3 +757,54 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
+
+# Public wrapper for external use (API/module)
+def find_the_roads(
+    city: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    k: Optional[int] = None,
+    r: Optional[float] = None,
+    mas: Optional[float] = None,
+    ml: Optional[float] = None,
+    no: Optional[bool] = False,
+) -> List[dict]:
+    """Module-friendly wrapper that returns list of roads as dicts.
+
+    Parameters:
+    - city: city name to geocode (if provided)
+    - lat, lon: coordinates to search (used when `city` is None)
+    - k: if provided, limits to first k results
+    - r: radius in meters
+    - mas: min average slope percent
+    - ml: min segment length in meters
+    """
+    if city:
+        lat, lon = geocode_location(city)
+    if lat is None or lon is None:
+        raise ValueError("Either city or lat and lon must be provided")
+
+    radius_m = r if (r is not None) else 3000
+    min_avg_slope = mas if (mas is not None) else 5.0
+    min_length = ml if (ml is not None) else MIN_SEGMENT_LENGTH_M
+
+    results = find_steep_roads(
+        lat=lat,
+        lon=lon,
+        radius_m=radius_m,
+        min_avg_slope=min_avg_slope,
+        min_length=min_length,
+        named_only=no,
+    )
+
+    # Convert dataclasses to dicts
+    dicts = [asdict(r) for r in results]
+
+    if k is not None and isinstance(k, int) and k > 0:
+        dicts = dicts[:k]
+
+    return dicts
+
+
+__all__ = ["find_steep_roads", "find_the_roads"]
