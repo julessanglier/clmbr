@@ -1,6 +1,0 @@
-dem_tiles/**
-
-*.html
-*.json
-*.pyc
-!devbox.json
