@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+requests
+numpy
+scipy
+shapely
+pyproj
+tqdm
+structlog
