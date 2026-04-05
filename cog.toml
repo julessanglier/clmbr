@@ -1,0 +1,25 @@
+from_latest_tag = false
+ignore_merge_commits = true
+branch_whitelist = ["main"]
+generate_mono_repository_global_tag = false
+
+pre_bump_hooks = []
+post_bump_hooks = []
+
+[changelog]
+path = "CHANGELOG.md"
+authors = [
+  { signature = "Jules Sanglier", username = "jules" },
+]
+
+[commit_types]
+feat = { changelog_title = "Features" }
+fix = { changelog_title = "Bug Fixes" }
+perf = { changelog_title = "Performance" }
+refactor = { changelog_title = "Refactoring" }
+chore = { changelog_title = "Miscellaneous" }
+docs = { changelog_title = "Documentation" }
+ci = { changelog_title = "CI/CD" }
+style = { changelog_title = "Style", omit_from_changelog = true }
+test = { changelog_title = "Tests" }
+build = { changelog_title = "Build" }
