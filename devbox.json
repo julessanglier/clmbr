@@ -1,0 +1,14 @@
+{
+  "packages": [
+    "nodejs_22",
+    "python3",
+    "gitleaks",
+    "cocogitto"
+  ],
+  "shell": {
+    "init_hook": [
+      "cog install-hook commit-msg 2>/dev/null || true",
+      "echo 'clmbr dev environment ready'"
+    ]
+  }
+}

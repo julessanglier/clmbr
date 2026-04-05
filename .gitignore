@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Build output
+dist/
+dist-ssr/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# DEM tiles (large binary files)
+dem_tiles/
+fabdem_tiles/
+
+# Devbox
+.devbox/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sw?
+
+# Logs
+*.log
