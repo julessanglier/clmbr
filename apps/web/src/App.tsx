@@ -57,50 +57,231 @@ function toggle3DTerrain(m: maplibregl.Map, enabled: boolean) {
   }
 }
 
-const DEFAULT_CENTER: [number, number] = [2.3522, 48.8566]
-const DEFAULT_ZOOM = 12
+const ENABLE_CAMERA_TRAVEL = import.meta.env.VITE_ENABLE_CAMERA_TRAVEL === 'true'
+const CAMERA_TRAVEL_SPEED = 30 // meters per second
+const CAMERA_LOOK_AHEAD_M = 40 // how far ahead the camera looks
 
-function makeCircle(lat: number, lon: number, radiusM: number, steps = 64): [number, number][] {
+function getCameraTravelCoords(
+  geojson: GeoJSON.FeatureCollection,
+  osmId: string,
+  profile: { d: number; e: number }[],
+): [number, number, number][] | null {
+  const feature = geojson.features.find((f) => {
+    const id = f.properties?.osm_id
+    return String(id) === String(osmId)
+  })
+  if (!feature) return null
+
+  const geom = feature.geometry
+  if (geom.type !== 'LineString') return null
+
+  const coords = geom.coordinates as [number, number][]
+  if (coords.length < 2 || profile.length < 2) return null
+
+  const totalDist = profile[profile.length - 1].d
+  const result: [number, number, number][] = []
+
+  for (let i = 0; i < coords.length; i++) {
+    const t = i / (coords.length - 1)
+    const d = t * totalDist
+    let elev = profile[0].e
+    for (let j = 0; j < profile.length - 1; j++) {
+      if (d >= profile[j].d && d <= profile[j + 1].d) {
+        const segT = (d - profile[j].d) / (profile[j + 1].d - profile[j].d || 1)
+        elev = profile[j].e + segT * (profile[j + 1].e - profile[j].e)
+        break
+      }
+    }
+    result.push([coords[i][0], coords[i][1], elev])
+  }
+
+  // Sort by elevation so we always travel uphill (low → high)
+  if (result[0][2] > result[result.length - 1][2]) {
+    result.reverse()
+  }
+
+  return result
+}
+
+function startCameraTravel(
+  m: maplibregl.Map,
+  path: [number, number, number][],
+  onDone: () => void,
+): () => void {
+  let cancelled = false
+
+  // Build cumulative distance array
+  const distances = [0]
+  for (let i = 1; i < path.length; i++) {
+    const [lon1, lat1] = path[i - 1]
+    const [lon2, lat2] = path[i]
+    const dlat = (lat2 - lat1) * 111320
+    const dlon = (lon2 - lon1) * 111320 * Math.cos(((lat1 + lat2) / 2) * Math.PI / 180)
+    distances.push(distances[i - 1] + Math.sqrt(dlat * dlat + dlon * dlon))
+  }
+  const totalDist = distances[distances.length - 1]
+  const totalTime = (totalDist / CAMERA_TRAVEL_SPEED) * 1000 // ms
+
+  function interpAtDist(d: number): [number, number, number] {
+    const clamped = Math.max(0, Math.min(d, totalDist))
+    for (let i = 0; i < distances.length - 1; i++) {
+      if (clamped >= distances[i] && clamped <= distances[i + 1]) {
+        const t = (clamped - distances[i]) / (distances[i + 1] - distances[i] || 1)
+        return [
+          path[i][0] + t * (path[i + 1][0] - path[i][0]),
+          path[i][1] + t * (path[i + 1][1] - path[i][1]),
+          path[i][2] + t * (path[i + 1][2] - path[i][2]),
+        ]
+      }
+    }
+    return path[path.length - 1]
+  }
+
+  function bearingBetween(
+    lon1: number, lat1: number, lon2: number, lat2: number,
+  ): number {
+    const dLon = (lon2 - lon1) * Math.PI / 180
+    const lat1r = lat1 * Math.PI / 180
+    const lat2r = lat2 * Math.PI / 180
+    const y = Math.sin(dLon) * Math.cos(lat2r)
+    const x = Math.cos(lat1r) * Math.sin(lat2r) -
+              Math.sin(lat1r) * Math.cos(lat2r) * Math.cos(dLon)
+    return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360
+  }
+
+  const startTime = performance.now()
+
+  function frame(now: number) {
+    if (cancelled) return
+    const elapsed = now - startTime
+    const progress = Math.min(elapsed / totalTime, 1)
+
+    const currentDist = progress * totalDist
+    const lookDist = Math.min(currentDist + CAMERA_LOOK_AHEAD_M, totalDist)
+
+    const pos = interpAtDist(currentDist)
+    const lookAt = interpAtDist(lookDist)
+    const bearing = bearingBetween(pos[0], pos[1], lookAt[0], lookAt[1])
+
+    m.jumpTo({
+      center: [pos[0], pos[1]],
+      zoom: 20,
+      pitch: 85,
+      bearing,
+    })
+
+    if (progress < 1) {
+      requestAnimationFrame(frame)
+    } else {
+      onDone()
+    }
+  }
+
+  requestAnimationFrame(frame)
+
+  return () => { cancelled = true }
+}
+
+// -- Animus-style scan animation over search area while loading --
+
+const ANIMUS_PULSE_S = 4 // time for one full center-to-edge pulse
+
+function makeDisc(
+  lat: number, lon: number, radiusM: number, steps: number = 80,
+): [number, number][] {
+  if (radiusM < 1) return [[lon, lat], [lon, lat], [lon, lat], [lon, lat]]
   const coords: [number, number][] = []
+  const dLon = 1 / (111320 * Math.cos((lat * Math.PI) / 180))
+  const dLat = 1 / 111320
   for (let i = 0; i <= steps; i++) {
-    const angle = (i / steps) * 2 * Math.PI
-    const dx = radiusM * Math.cos(angle)
-    const dy = radiusM * Math.sin(angle)
-    const dLat = dy / 111320
-    const dLon = dx / (111320 * Math.cos((lat * Math.PI) / 180))
-    coords.push([lon + dLon, lat + dLat])
+    const a = (i / steps) * 2 * Math.PI
+    coords.push([lon + radiusM * Math.cos(a) * dLon, lat + radiusM * Math.sin(a) * dLat])
   }
   return coords
 }
 
-function updateSearchArea(map: maplibregl.Map, lat: number, lon: number, radiusM: number) {
-  const geojson: GeoJSON.FeatureCollection = {
-    type: 'FeatureCollection',
-    features: [{
-      type: 'Feature',
-      geometry: { type: 'Polygon', coordinates: [makeCircle(lat, lon, radiusM)] },
-      properties: {},
-    }],
+function startScanAnimation(
+  m: maplibregl.Map, lat: number, lon: number, radiusM: number,
+): () => void {
+  let cancelled = false
+  const empty: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] }
+
+  if (!m.getSource('animus-src')) m.addSource('animus-src', { type: 'geojson', data: empty })
+  // Outer glow — wide blurred halo
+  if (!m.getLayer('animus-glow')) {
+    m.addLayer({
+      id: 'animus-glow', type: 'line', source: 'animus-src',
+      paint: { 'line-color': '#bae6fd', 'line-width': 20, 'line-opacity': 0, 'line-blur': 14 },
+    })
+  }
+  // Inner shimmer
+  if (!m.getLayer('animus-inner')) {
+    m.addLayer({
+      id: 'animus-inner', type: 'line', source: 'animus-src',
+      paint: { 'line-color': '#7dd3fc', 'line-width': 6, 'line-opacity': 0, 'line-blur': 4 },
+    })
+  }
+  // Sharp bright edge
+  if (!m.getLayer('animus-edge')) {
+    m.addLayer({
+      id: 'animus-edge', type: 'line', source: 'animus-src',
+      paint: { 'line-color': '#f0f9ff', 'line-width': 2.5, 'line-opacity': 0 },
+    })
   }
 
-  if (map.getSource('search-area')) {
-    (map.getSource('search-area') as maplibregl.GeoJSONSource).setData(geojson)
-    return
+  const startTime = performance.now()
+
+  function frame(now: number) {
+    if (cancelled) return
+    const elapsed = (now - startTime) / 1000
+    // t goes 0→1 per pulse, then resets
+    const t = (elapsed % ANIMUS_PULSE_S) / ANIMUS_PULSE_S
+
+    // Ease-out: fast start, decelerates toward edge
+    const eased = 1 - Math.pow(1 - t, 3)
+    const waveR = radiusM * eased
+
+    // Opacity: fade in quickly, hold, fade out in last 10%
+    const opacity = t < 0.05
+      ? t / 0.05
+      : t < 0.9
+        ? 1
+        : (1 - t) / 0.1
+
+    const ring = makeDisc(lat, lon, waveR)
+    ;(m.getSource('animus-src') as maplibregl.GeoJSONSource)?.setData({
+      type: 'FeatureCollection',
+      features: [{ type: 'Feature', geometry: { type: 'LineString', coordinates: ring }, properties: {} }],
+    })
+
+    if (m.getLayer('animus-glow')) m.setPaintProperty('animus-glow', 'line-opacity', opacity * 0.4)
+    if (m.getLayer('animus-inner')) m.setPaintProperty('animus-inner', 'line-opacity', opacity * 0.5)
+    if (m.getLayer('animus-edge')) m.setPaintProperty('animus-edge', 'line-opacity', opacity * 0.9)
+
+    requestAnimationFrame(frame)
   }
 
-  map.addSource('search-area', { type: 'geojson', data: geojson })
-  map.addLayer({
-    id: 'search-area-fill',
-    type: 'fill',
-    source: 'search-area',
-    paint: { 'fill-color': '#3b82f6', 'fill-opacity': 0.05 },
-  })
-  map.addLayer({
-    id: 'search-area-line',
-    type: 'line',
-    source: 'search-area',
-    paint: { 'line-color': '#3b82f6', 'line-opacity': 0.3, 'line-width': 1, 'line-dasharray': [4, 3] },
-  })
+  requestAnimationFrame(frame)
+
+  return () => {
+    cancelled = true
+    for (const id of ['animus-edge', 'animus-inner', 'animus-glow']) {
+      if (m.getLayer(id)) m.removeLayer(id)
+    }
+    if (m.getSource('animus-src')) m.removeSource('animus-src')
+  }
+}
+
+const DEFAULT_CENTER: [number, number] = [2.3522, 48.8566]
+const DEFAULT_ZOOM = 12
+
+/** Convert map zoom level to a search radius in meters.
+ *  zoom 16 → ~300m, zoom 14 → ~1200m, zoom 12 → ~4000m, zoom 10 → ~10000m */
+function radiusFromZoom(zoom: number): number {
+  const metersPerPx = 156543.03 * Math.cos(0) / Math.pow(2, zoom)
+  // Use ~40% of the viewport width (assume ~800px) as radius, clamped
+  const r = metersPerPx * 320
+  return Math.max(300, Math.min(r, 10000))
 }
 
 type Profiles = Record<string, { d: number; e: number; s: number }[]>
@@ -367,6 +548,7 @@ function App() {
   const map = useRef<maplibregl.Map | null>(null)
   const profilesRef = useRef<Profiles>({})
   const roadPropsRef = useRef<RoadPropsMap>({})
+  const geojsonRef = useRef<GeoJSON.FeatureCollection | null>(null)
   const [locationError, setLocationError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [roadCount, setRoadCount] = useState<number | null>(null)
@@ -380,6 +562,9 @@ function App() {
   const userMarkerRef = useRef<maplibregl.Marker | null>(null)
   const routeModeRef = useRef(false)
   routeModeRef.current = routeMode
+  const lastFetchRef = useRef<{ lat: number; lon: number; zoom: number } | null>(null)
+  const loadingRef = useRef(false)
+  loadingRef.current = loading
   const [devParams, setDevParams] = useState<DevParams>({
     radius: 2000,
     minSlope: 5,
@@ -392,47 +577,81 @@ function App() {
     setSelectedRoad({ osmId, name })
   }, [])
 
+  const abortRef = useRef<AbortController | null>(null)
+  const stopScanRef = useRef<(() => void) | null>(null)
+  const fetchRoadsRef = useRef<(m: maplibregl.Map, lat: number, lon: number) => void>(() => {})
+
   const fetchRoads = useCallback(async (m: maplibregl.Map, lat: number, lon: number) => {
+    // Abort any in-flight request and stop its animation
+    if (abortRef.current) abortRef.current.abort()
+    if (stopScanRef.current) stopScanRef.current()
+
+    const controller = new AbortController()
+    abortRef.current = controller
+
     const dp = devParamsRef.current
+    const zoom = m.getZoom()
+    const radius = radiusFromZoom(zoom)
+    lastFetchRef.current = { lat, lon, zoom }
     setLoading(true)
     setSelectedRoad(null)
+
+    const stopScan = startScanAnimation(m, lat, lon, radius)
+    stopScanRef.current = stopScan
+
     try {
       const params = new URLSearchParams({
         lat: String(lat),
         lon: String(lon),
-        radius: String(dp.radius),
+        radius: String(radius),
         min_slope: String(dp.minSlope),
         model: dp.model,
       })
-      const res = await fetch(`/api/roads?${params}`)
+      const res = await fetch(`/api/roads?${params}`, { signal: controller.signal })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      const geojson = data.geojson as GeoJSON.FeatureCollection
-      profilesRef.current = data.profiles as Profiles
-      const propsMap: RoadPropsMap = {}
-      for (const feature of geojson.features) {
-        const p = feature.properties as unknown as RoadProperties
-        propsMap[String(p.osm_id)] = p
+      const newGeojson = data.geojson as GeoJSON.FeatureCollection
+      const newProfiles = data.profiles as Profiles
+
+      // Merge new results into existing — deduplicate by osm_id
+      const existingIds = new Set(
+        (geojsonRef.current?.features ?? []).map((f) => String(f.properties?.osm_id)),
+      )
+      const merged: GeoJSON.FeatureCollection = {
+        type: 'FeatureCollection',
+        features: [
+          ...(geojsonRef.current?.features ?? []),
+          ...newGeojson.features.filter((f) => !existingIds.has(String(f.properties?.osm_id))),
+        ],
       }
-      roadPropsRef.current = propsMap
-      setRoadCount(geojson.features.length)
-      updateSearchArea(m, lat, lon, dp.radius)
-      addRoadsLayer(m, geojson, handleRoadClick)
+
+      profilesRef.current = { ...profilesRef.current, ...newProfiles }
+      geojsonRef.current = merged
+      for (const feature of newGeojson.features) {
+        const p = feature.properties as unknown as RoadProperties
+        roadPropsRef.current[String(p.osm_id)] = p
+      }
+      setRoadCount(merged.features.length)
+      addRoadsLayer(m, merged, handleRoadClick)
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
       console.error('Failed to fetch roads:', err)
       setLocationError('Failed to load roads.')
     } finally {
+      stopScan()
+      stopScanRef.current = null
       setLoading(false)
     }
   }, [handleRoadClick])
+  fetchRoadsRef.current = fetchRoads
 
   const handleCitySelect = useCallback((lat: number, lon: number) => {
     const m = map.current
     if (!m) return
     setSelectedRoad(null)
     m.flyTo({ center: [lon, lat], zoom: 14 })
-    m.once('idle', () => fetchRoads(m, lat, lon))
-  }, [fetchRoads])
+    // auto-fetch will trigger via moveend
+  }, [])
 
   const handleRefetch = useCallback(() => {
     const m = map.current
@@ -456,6 +675,36 @@ function App() {
 
     m.on('style.load', () => {
       ensureTerrainSource(m)
+    })
+
+    // Auto-fetch roads when map settles after user interaction
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+    m.on('moveend', (e) => {
+      // Skip programmatic moves (flyTo, easeTo from city search / locate)
+      if ((e as any).originalEvent == null && !m.isMoving()) {
+        // Could be end of flyTo — let it settle, then check
+      }
+      if (debounceTimer) clearTimeout(debounceTimer)
+      debounceTimer = setTimeout(() => {
+        if (routeModeRef.current) return
+        if (m.isMoving() || m.isZooming()) return
+
+        const center = m.getCenter()
+        const zoom = m.getZoom()
+        if (zoom < 11) return
+
+        const last = lastFetchRef.current
+        if (last) {
+          const dist = Math.sqrt(
+            Math.pow(center.lat - last.lat, 2) + Math.pow(center.lng - last.lon, 2)
+          ) * 111320
+          const zoomDelta = Math.abs(zoom - last.zoom)
+          if (dist < radiusFromZoom(zoom) * 0.3 && zoomDelta < 1) return
+        }
+
+        fetchRoadsRef.current(m, center.lat, center.lng)
+      }, 1200)
     })
 
     m.on('click', (e) => {
@@ -488,10 +737,21 @@ function App() {
     const m = map.current
     if (!m) return
     highlightRoad(m, selectedRoad?.osmId ?? null)
-    if (selectedRoad) {
-      flyToRoad(m, selectedRoad.osmId)
+    if (!selectedRoad) return
+
+    if (ENABLE_CAMERA_TRAVEL && reliefOn && geojsonRef.current) {
+      const profile = profilesRef.current[selectedRoad.osmId]
+      if (profile) {
+        const path = getCameraTravelCoords(geojsonRef.current, selectedRoad.osmId, profile)
+        if (path && path.length >= 2) {
+          const cancel = startCameraTravel(m, path, () => {})
+          return () => cancel()
+        }
+      }
     }
-  }, [selectedRoad])
+
+    flyToRoad(m, selectedRoad.osmId)
+  }, [selectedRoad, reliefOn])
 
   // When entering route mode, deselect road. When leaving, clean up.
   useEffect(() => {
@@ -566,7 +826,7 @@ function App() {
           .setLngLat([longitude, latitude])
           .addTo(m)
         setLocationError(null)
-        m.once('idle', () => fetchRoads(m, latitude, longitude))
+        // auto-fetch will trigger via moveend
       },
       (err) => {
         switch (err.code) {
@@ -591,13 +851,15 @@ function App() {
   return (
     <div className="relative h-screen w-screen">
       <div ref={mapContainer} className="h-full w-full" />
-      <CitySearch onSelect={handleCitySelect} />
-      <DevMenu
-        params={devParams}
-        onChange={setDevParams}
-        onRefetch={handleRefetch}
-        loading={loading}
-      />
+      <CitySearch onSelect={handleCitySelect} onLocate={handleLocate} />
+      {import.meta.env.VITE_DEV_MENU === 'true' && (
+        <DevMenu
+          params={devParams}
+          onChange={setDevParams}
+          onRefetch={handleRefetch}
+          loading={loading}
+        />
+      )}
 
       {loading && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 rounded-md bg-black/80 px-4 py-2 text-sm text-white">
@@ -639,20 +901,7 @@ function App() {
         >
           Route
         </button>
-        <button
-          onClick={handleLocate}
-          className="flex h-9 w-9 items-center justify-center rounded-md border border-white/10 bg-black/70 text-white/50 backdrop-blur-sm transition-colors hover:text-white"
-          title="Locate me"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="4" />
-            <path d="M12 2v4" />
-            <path d="M12 18v4" />
-            <path d="M2 12h4" />
-            <path d="M18 12h4" />
-          </svg>
-        </button>
-        <button
+<button
           onClick={() => setReliefOn((v) => !v)}
           className={`flex h-9 items-center justify-center rounded-md border px-2.5 text-xs font-medium backdrop-blur-sm transition-colors ${
             reliefOn
