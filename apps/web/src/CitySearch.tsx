@@ -9,9 +9,10 @@ interface Suggestion {
 
 interface CitySearchProps {
   onSelect: (lat: number, lon: number) => void
+  onLocate: () => void
 }
 
-export default function CitySearch({ onSelect }: CitySearchProps) {
+export default function CitySearch({ onSelect, onLocate }: CitySearchProps) {
   const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [open, setOpen] = useState(false)
@@ -59,13 +60,25 @@ export default function CitySearch({ onSelect }: CitySearchProps) {
 
   return (
     <div ref={containerRef} className="absolute top-4 left-4 z-20 w-72">
-      <Input
-        placeholder="Search city..."
-        value={query}
-        onChange={(e) => handleChange(e.target.value)}
-        onFocus={() => suggestions.length > 0 && setOpen(true)}
-        className="truncate bg-black/70 text-white placeholder:text-white/40 border-white/10 backdrop-blur-sm"
-      />
+      <div className="flex gap-1.5">
+        <Input
+          placeholder="Search city..."
+          value={query}
+          onChange={(e) => handleChange(e.target.value)}
+          onFocus={() => suggestions.length > 0 && setOpen(true)}
+          className="truncate bg-black/70 text-white placeholder:text-white/40 border-white/10 backdrop-blur-sm"
+        />
+        <button
+          onClick={onLocate}
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-white/10 bg-black/70 text-white/50 backdrop-blur-sm hover:text-white"
+          title="Go to my location"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" />
+            <path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+          </svg>
+        </button>
+      </div>
       {open && (
         <ul className="mt-1 max-h-60 overflow-y-auto rounded-md bg-black/80 backdrop-blur-sm border border-white/10">
           {suggestions.map((s, i) => (
