@@ -4,7 +4,7 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import CitySearch from './CitySearch'
 import ElevationProfile from './ElevationProfile'
 import DevMenu, { type DevParams } from './DevMenu'
-// import Splash from './Splash'
+import RouteCreator, { type RouteResult } from './RouteCreator'
 
 const DARK_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
 
@@ -21,13 +21,39 @@ function ensureTerrainSource(m: maplibregl.Map) {
   })
 }
 
+const BUILDINGS_SOURCE_ID = 'openmaptiles'
+const BUILDINGS_LAYER_ID = 'buildings-3d'
+
 function toggle3DTerrain(m: maplibregl.Map, enabled: boolean) {
   if (!m.isStyleLoaded()) return
   ensureTerrainSource(m)
   if (enabled) {
     m.setTerrain({ source: TERRAIN_SOURCE_ID, exaggeration: 1.5 })
+
+    if (!m.getSource(BUILDINGS_SOURCE_ID)) {
+      m.addSource(BUILDINGS_SOURCE_ID, {
+        type: 'vector',
+        url: 'https://tiles.openfreemap.org/planet',
+      })
+    }
+    if (!m.getLayer(BUILDINGS_LAYER_ID)) {
+      m.addLayer({
+        id: BUILDINGS_LAYER_ID,
+        source: BUILDINGS_SOURCE_ID,
+        'source-layer': 'building',
+        type: 'fill-extrusion',
+        paint: {
+          'fill-extrusion-color': '#1a1a2e',
+          'fill-extrusion-height': ['get', 'render_height'],
+          'fill-extrusion-base': ['get', 'render_min_height'],
+          'fill-extrusion-opacity': 0.7,
+        },
+      })
+    }
   } else {
     m.setTerrain(undefined as any)
+    if (m.getLayer(BUILDINGS_LAYER_ID)) m.removeLayer(BUILDINGS_LAYER_ID)
+    if (m.getSource(BUILDINGS_SOURCE_ID)) m.removeSource(BUILDINGS_SOURCE_ID)
   }
 }
 
@@ -277,6 +303,65 @@ function flyToRoad(m: maplibregl.Map, osmId: string) {
   })
 }
 
+function addRouteLayer(m: maplibregl.Map, geojson: GeoJSON.FeatureCollection) {
+  if (m.getSource('generated-route')) {
+    (m.getSource('generated-route') as maplibregl.GeoJSONSource).setData(geojson)
+    return
+  }
+
+  m.addSource('generated-route', { type: 'geojson', data: geojson })
+
+  m.addLayer({
+    id: 'generated-route-glow',
+    type: 'line',
+    source: 'generated-route',
+    paint: {
+      'line-color': '#8b5cf6',
+      'line-width': 12,
+      'line-opacity': 0.2,
+      'line-blur': 4,
+    },
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+  })
+
+  m.addLayer({
+    id: 'generated-route-line',
+    type: 'line',
+    source: 'generated-route',
+    paint: {
+      'line-color': '#8b5cf6',
+      'line-width': 4,
+      'line-opacity': 0.9,
+    },
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+  })
+}
+
+function removeRouteLayer(m: maplibregl.Map) {
+  if (m.getLayer('generated-route-line')) m.removeLayer('generated-route-line')
+  if (m.getLayer('generated-route-glow')) m.removeLayer('generated-route-glow')
+  if (m.getSource('generated-route')) m.removeSource('generated-route')
+}
+
+function fitRouteOnMap(m: maplibregl.Map, geojson: GeoJSON.FeatureCollection) {
+  const bounds = new maplibregl.LngLatBounds()
+  for (const feature of geojson.features) {
+    const geom = feature.geometry
+    if (geom.type === 'LineString') {
+      for (const coord of geom.coordinates) {
+        bounds.extend(coord as [number, number])
+      }
+    }
+  }
+  if (!bounds.isEmpty()) {
+    m.fitBounds(bounds, {
+      padding: { top: 60, bottom: 60, left: 60, right: 400 },
+      maxZoom: 16,
+      duration: 1000,
+    })
+  }
+}
+
 function App() {
   const mapContainer = useRef<HTMLDivElement>(null)
   const map = useRef<maplibregl.Map | null>(null)
@@ -287,6 +372,14 @@ function App() {
   const [roadCount, setRoadCount] = useState<number | null>(null)
   const [selectedRoad, setSelectedRoad] = useState<{ osmId: string; name: string } | null>(null)
   const [reliefOn, setReliefOn] = useState(false)
+  const [routeMode, setRouteMode] = useState(false)
+  const [routeStart, setRouteStart] = useState<{ lat: number; lon: number } | null>(null)
+  const [routeResult, setRouteResult] = useState<RouteResult | null>(null)
+  const [routeLoading, setRouteLoading] = useState(false)
+  const startMarkerRef = useRef<maplibregl.Marker | null>(null)
+  const userMarkerRef = useRef<maplibregl.Marker | null>(null)
+  const routeModeRef = useRef(false)
+  routeModeRef.current = routeMode
   const [devParams, setDevParams] = useState<DevParams>({
     radius: 2000,
     minSlope: 5,
@@ -365,31 +458,21 @@ function App() {
       ensureTerrainSource(m)
     })
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const { longitude, latitude } = pos.coords
-        m.flyTo({ center: [longitude, latitude], zoom: 14 })
-        new maplibregl.Marker({ color: '#3b82f6' })
-          .setLngLat([longitude, latitude])
-          .addTo(m)
-        setLocationError(null)
-        m.once('idle', () => fetchRoads(m, latitude, longitude))
-      },
-      (err) => {
-        switch (err.code) {
-          case err.PERMISSION_DENIED:
-            setLocationError('Location access denied. Using default location.')
-            break
-          case err.POSITION_UNAVAILABLE:
-            setLocationError('Location unavailable. Using default location.')
-            break
-          case err.TIMEOUT:
-            setLocationError('Location request timed out. Using default location.')
-            break
-        }
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 300000 },
-    )
+    m.on('click', (e) => {
+      if (!routeModeRef.current) return
+      const { lat, lng: lon } = e.lngLat
+
+      // Remove existing start marker
+      if (startMarkerRef.current) {
+        startMarkerRef.current.remove()
+      }
+
+      const marker = new maplibregl.Marker({ color: '#22c55e' })
+        .setLngLat([lon, lat])
+        .addTo(m)
+      startMarkerRef.current = marker
+      setRouteStart({ lat, lon })
+    })
 
     return () => m.remove()
   }, [])
@@ -409,6 +492,98 @@ function App() {
       flyToRoad(m, selectedRoad.osmId)
     }
   }, [selectedRoad])
+
+  // When entering route mode, deselect road. When leaving, clean up.
+  useEffect(() => {
+    const m = map.current
+    if (routeMode) {
+      setSelectedRoad(null)
+      if (m) m.getCanvas().style.cursor = 'crosshair'
+    } else {
+      if (m) {
+        m.getCanvas().style.cursor = ''
+        removeRouteLayer(m)
+      }
+      if (startMarkerRef.current) {
+        startMarkerRef.current.remove()
+        startMarkerRef.current = null
+      }
+      setRouteStart(null)
+      setRouteResult(null)
+    }
+  }, [routeMode])
+
+  const handleRouteGenerate = useCallback(async (distanceKm: number, elevationGainM: number, mode: string) => {
+    if (!routeStart) return
+    setRouteLoading(true)
+    try {
+      const res = await fetch('/api/route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lat: routeStart.lat,
+          lon: routeStart.lon,
+          target_distance_km: distanceKm,
+          target_elevation_gain_m: elevationGainM,
+          mode,
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => null)
+        throw new Error(err?.detail || `HTTP ${res.status}`)
+      }
+      const data: RouteResult = await res.json()
+      setRouteResult(data)
+
+      const m = map.current
+      if (m) {
+        addRouteLayer(m, data.geojson as GeoJSON.FeatureCollection)
+        fitRouteOnMap(m, data.geojson as GeoJSON.FeatureCollection)
+      }
+    } catch (err) {
+      console.error('Route generation failed:', err)
+      setLocationError(err instanceof Error ? err.message : 'Route generation failed')
+    } finally {
+      setRouteLoading(false)
+    }
+  }, [routeStart])
+
+  const handleRouteClear = useCallback(() => {
+    const m = map.current
+    if (m) removeRouteLayer(m)
+    setRouteResult(null)
+  }, [])
+
+  const handleLocate = useCallback(() => {
+    const m = map.current
+    if (!m) return
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const { longitude, latitude } = pos.coords
+        m.flyTo({ center: [longitude, latitude], zoom: 14 })
+        if (userMarkerRef.current) userMarkerRef.current.remove()
+        userMarkerRef.current = new maplibregl.Marker({ color: '#3b82f6' })
+          .setLngLat([longitude, latitude])
+          .addTo(m)
+        setLocationError(null)
+        m.once('idle', () => fetchRoads(m, latitude, longitude))
+      },
+      (err) => {
+        switch (err.code) {
+          case err.PERMISSION_DENIED:
+            setLocationError('Location access denied.')
+            break
+          case err.POSITION_UNAVAILABLE:
+            setLocationError('Location unavailable.')
+            break
+          case err.TIMEOUT:
+            setLocationError('Location request timed out.')
+            break
+        }
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 300000 },
+    )
+  }, [fetchRoads])
 
   const selectedProfile = selectedRoad ? profilesRef.current[selectedRoad.osmId] : null
   const selectedProps = selectedRoad ? roadPropsRef.current[selectedRoad.osmId] : null
@@ -452,26 +627,63 @@ function App() {
         </div>
       )}
 
-      <button
-        onClick={() => setReliefOn((v) => !v)}
-        className={`absolute bottom-6 right-4 z-10 flex h-9 w-9 items-center justify-center rounded-md border text-sm backdrop-blur-sm transition-colors ${
-          reliefOn
-            ? 'border-white/20 bg-white/15 text-white'
-            : 'border-white/10 bg-black/70 text-white/50 hover:text-white'
-        }`}
-        title={reliefOn ? 'Hide relief' : 'Show relief'}
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="m8 3 4 8 5-5 5 15H2L8 3z" />
-        </svg>
-      </button>
+      <div className="absolute top-4 right-4 z-10 flex gap-2">
+        <button
+          onClick={() => setRouteMode((v) => !v)}
+          className={`flex h-9 items-center justify-center rounded-md border px-2.5 text-xs font-medium backdrop-blur-sm transition-colors ${
+            routeMode
+              ? 'border-violet-400/40 bg-violet-500/20 text-violet-300'
+              : 'border-white/10 bg-black/70 text-white/50 hover:text-white'
+          }`}
+          title={routeMode ? 'Exit route creator' : 'Create a route'}
+        >
+          Route
+        </button>
+        <button
+          onClick={handleLocate}
+          className="flex h-9 w-9 items-center justify-center rounded-md border border-white/10 bg-black/70 text-white/50 backdrop-blur-sm transition-colors hover:text-white"
+          title="Locate me"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="4" />
+            <path d="M12 2v4" />
+            <path d="M12 18v4" />
+            <path d="M2 12h4" />
+            <path d="M18 12h4" />
+          </svg>
+        </button>
+        <button
+          onClick={() => setReliefOn((v) => !v)}
+          className={`flex h-9 items-center justify-center rounded-md border px-2.5 text-xs font-medium backdrop-blur-sm transition-colors ${
+            reliefOn
+              ? 'border-white/20 bg-white/15 text-white'
+              : 'border-white/10 bg-black/70 text-white/50 hover:text-white'
+          }`}
+          title={reliefOn ? 'Hide relief' : 'Show relief'}
+        >
+          3D
+        </button>
+      </div>
 
-      {selectedProfile && selectedRoad && selectedProps && (
+      {/* Elevation profile panel (hidden in route mode) */}
+      {!routeMode && selectedProfile && selectedRoad && selectedProps && (
         <ElevationProfile
           profile={selectedProfile}
           name={selectedRoad.name}
           properties={selectedProps}
           onClose={() => setSelectedRoad(null)}
+        />
+      )}
+
+      {/* Route creator panel */}
+      {routeMode && (
+        <RouteCreator
+          start={routeStart}
+          result={routeResult}
+          loading={routeLoading}
+          onGenerate={handleRouteGenerate}
+          onClear={handleRouteClear}
+          onClose={() => setRouteMode(false)}
         />
       )}
 
